@@ -1,0 +1,339 @@
+# Registry entries from different domains; none needs platform code.
+
+- kind: data
+  id: nwm-retrospective-3.0-forcing
+  version: 1.0.0
+  title: NWM 3.0 retrospective forcings (AWS open data)
+  data_kind: external
+  visibility: public
+  storage:
+    driver: external
+    url: s3://noaa-nwm-retrospective-3-0-pds/CONUS/zarr/forcing/
+    format: zarr
+
+- kind: data
+  id: hydrofabric-v2.2
+  version: 1.0.0
+  title: Hydrofabric v2.2 (icefabric schemas)
+  data_kind: managed
+  visibility: public
+  storage:
+    driver: iceberg
+    tables:
+      network:
+        columns: {ref: icefabric.hydrofabric_v2.2.Network}
+        partition: [{transform: identity, column: vpuid}]
+        sort: [id]
+
+- kind: data
+  id: teehr.secondary-timeseries
+  version: 1.0.0
+  title: Model time series (TEEHR schema)
+  data_kind: output
+  storage:
+    driver: iceberg
+    tables:
+      secondary_timeseries:
+        columns:
+          - {name: location_id, type: string, required: true}
+          - {name: value_time, type: timestamp, required: true}
+          - {name: value, type: float}
+          - {name: configuration_name, type: string, required: true}
+        partition:
+          - {transform: month, column: value_time}
+          - {transform: identity, column: configuration_name}
+        sort: [location_id, value_time]
+
+- kind: data
+  id: fim.depth-grids
+  version: 1.0.0
+  title: Flood depth grids
+  data_kind: output
+  storage:
+    driver: stac
+    format: cog
+    extensions: [raster, projection]
+    properties: {datetime: run.end, "proj:epsg": manifest.crs}
+
+- kind: tool
+  id: hydrofabric-subset
+  version: 0.1.0
+  title: Hydrofabric subset (upstream of a gage)
+  image: ghcr.io/example/hydrofabric-subset:0.1.0
+  command: [hydrofabric-subset]
+  args: [--id, "{outlet}", --out, "{workdir}/region.gpkg"]
+  inputs:
+    - {name: hydrofabric, type: dataset, data: hydrofabric-v2.2}
+    - {name: outlet, type: string, pattern: '(gage|cat)-[0-9A-Za-z]+', description: "gage-… or cat-…"}
+  outputs:
+    - {name: region, type: file, data: hydrofabric-gpkg, path: region.gpkg}
+  runs_on: [argo]
+
+- kind: data
+  id: hydrofabric-gpkg
+  version: 1.0.0
+  title: Hydrofabric as a GeoPackage (ngen layout)
+  data_kind: output
+  storage: {driver: stac, format: other}
+
+- kind: data
+  id: hydrofabric-graph
+  version: 1.0.0
+  title: Hydrofabric network graph (igraph pickle)
+  data_kind: output
+  storage: {driver: stac, format: other}
+
+- kind: data
+  id: ngen-run
+  version: 1.0.0
+  title: NGIAB run folder
+  data_kind: output
+  storage: {driver: stac, format: other}
+
+# Images built in hydrowf-tools (nextgen/<tool>/Dockerfile) are released by a tag <tool>/v<version>,
+# which publishes ghcr.io/aquaveo/<tool>:<version>. Each is pinned here by digest (the lego model takes
+# a tag or a digest, not both), with the version it was released as in a comment.
+
+# From hydrowf-tools nextgen/ngiab-preprocess (the spec it was copied from).
+- kind: tool
+  id: ngiab-preprocess
+  version: 4.9.5
+  title: NGIAB data preprocess
+  image: ghcr.io/aquaveo/ngiab-preprocess@sha256:9f6f9429c01a3e99cd81c1d0a738efcdff658075903c10504094c311ab874d5d   # 4.9.5.dev2-02c4145
+  command: [cli]
+  # The preprocessor reads the hydrofabric from ~/.ngiab/hydrofabric/v2.2/, so HOME is the workdir.
+  env: {HOME: "{workdir}"}
+  files: {.ngiab/hydrofabric/v2.2/no_update: ""}       # stops validate_hydrofabric() from prompting
+  network: true                                         # forcings come from public S3 buckets
+  args:
+    - --output_root
+    - "{workdir}"
+    - -o
+    - "{workdir}/{run_name}"
+    - -s
+    - -f
+    - -r
+    - -i
+    - "{feature}"
+    - --start_date
+    - "{start_date}"
+    - --end_date
+    - "{end_date}"
+    - {when: model, args: ["--{model}"]}
+    - --source
+    - "{source}"
+    - --subset_type
+    - "{subset_type}"
+    - {when: nwm_gw, args: [--nwm_gw]}
+    - --precip_max_gap
+    - "{precip_max_gap}"
+  inputs:
+    # the forms ngiab_data_cli parses: gage-<id> is looked up, anything else becomes cat-<last part>;
+    # dates are strptime "%Y-%m-%d" or "%Y-%m-%d %H:%M"
+    - {name: feature, type: string, pattern: '(gage|cat|wb)-[0-9A-Za-z]+|[0-9]+',
+       description: "gage-01646500, or a catchment: cat-5173 (wb-5173 and 5173 mean the same)"}
+    - {name: start_date, type: string, pattern: '[0-9]{4}-[0-9]{2}-[0-9]{2}( [0-9]{2}:[0-9]{2})?', description: "2017-10-01 or 2017-10-01 06:00"}
+    - {name: end_date, type: string, pattern: '[0-9]{4}-[0-9]{2}-[0-9]{2}( [0-9]{2}:[0-9]{2})?'}
+    - {name: model, type: enum, symbols: [lstm, lstm_rust, dhbv2, dhbv2_daily, summa, snow17, sacsma],
+       optional: true, description: "empty = CFE + NOAH-OWP"}
+    - {name: source, type: enum, symbols: [nwm, aorc], default: nwm}
+    - {name: subset_type, type: enum, symbols: [nexus, catchment], default: nexus}
+    - {name: nwm_gw, type: boolean, default: false}
+    - {name: precip_max_gap, type: int, default: 6}
+    - {name: run_name, type: string, default: ngen-run}
+    - {name: hydrofabric, type: file, data: hydrofabric-gpkg,
+       path: .ngiab/hydrofabric/v2.2/conus_nextgen.gpkg}
+    - {name: hydrofabric_graph, type: file, data: hydrofabric-graph, optional: true,
+       path: .ngiab/hydrofabric/v2.2/conus_igraph_network.gpickle}
+  outputs:
+    - {name: ngen_run, type: directory, data: ngen-run, path: "{run_name}"}
+  cpu: 4
+  ram_mb: 16384
+
+# From hydrowf-tools nextgen/ngiab-run/ngiab-run.cwl. No command: the image's ENTRYPOINT
+# (/ngen/HelloNGEN.sh) takes <run dir> auto <procs> local.
+- kind: tool
+  id: ngiab-run
+  version: 2.1.0
+  title: NextGen run (NGIAB)
+  image: awiciroh/ciroh-ngen-image@sha256:d5ee1a6c15c025f9be2f9ce140dd9cdc2e933bc30f531a41f180d45b15c8ab17
+  args: ["{ngen_run}", auto, "{cpu}", local]
+  inputs:
+    - {name: ngen_run, type: directory, data: ngen-run, path: ngen-run}
+  outputs:
+    - {name: ngen_run, type: directory, data: ngen-run, path: ngen-run}   # same folder, outputs/ filled in
+  cpu: 4
+  ram_mb: 2048
+
+- kind: data
+  id: ngen-cng
+  version: 1.0.0
+  title: NGIAB run as cloud-native files (Parquet, Zarr, COG, manifest.json)
+  data_kind: output
+  storage: {driver: stac, format: other}
+
+# From hydrowf-tools nextgen/ngiab-to-cng. `command` repeats its ENTRYPOINT, so Argo's emissary
+# doesn't have to ask the registry for it (hydrowf-platform docs/argo-findings.md).
+- kind: tool
+  id: ngiab-to-cng
+  version: 0.1.0
+  title: NGIAB run to cloud-native files
+  image: ghcr.io/aquaveo/ngiab-to-cng@sha256:7a41fef9514ccf984625ed1a03e4f6f0c019d7bcce55f89164f6b7af64c3cb42   # 0.1.0
+  command: [python, /app/ngiab_to_cng.py]
+  args:
+    - "{ngen_run}"
+    - --output
+    - "{workdir}/ngen-run_cng"
+    - --run-id
+    - "{run}"                       # the platform's id for this run (Argo: the workflow name)
+    - --configuration-name
+    - "{configuration_name}"
+  inputs:
+    - {name: ngen_run, type: directory, data: ngen-run, path: ngen-run}
+    - {name: configuration_name, type: string, default: ngiab, pattern: '[A-Za-z0-9][A-Za-z0-9_-]*',   # read by argparse: never -x
+       description: TEEHR configuration name}
+  outputs:
+    - {name: cng, type: directory, data: ngen-cng, path: ngen-run_cng}
+  cpu: 1
+  ram_mb: 2048
+
+# From hydrowf-tools nextgen/ngiab-calibrate (ngiab-cal + ngen-cal, built on the image ngiab-run
+# uses). `command` repeats its ENTRYPOINT, as for ngiab-to-cng. The script copies the run
+# folder to the output path and calibrates the copy (DDS, KGE against the gage's USGS observations):
+# the calibrated model_params go into config/realization.json, with a calibration/ folder beside it.
+- kind: tool
+  id: ngiab-calibrate
+  version: 0.2.0
+  title: NextGen calibration (ngiab-cal)
+  image: ghcr.io/aquaveo/ngiab-calibrate@sha256:51a12857ac87b8b2a9decde21f9885370812752fc84816252e5f269258cef79b   # 0.2.0
+  command: [/opt/ngiab_calibrate.sh]
+  # The image runs as uid 1000, which has no passwd entry, so HOME is "/" and hydrotools' USGS cache
+  # (~/.ngiab) can't be created; cwltool sets HOME to the output dir, Argo doesn't.
+  env: {HOME: "{workdir}"}
+  network: true                                         # USGS observations
+  args:
+    - "{ngen_run}"
+    - "{workdir}/ngen-run_calibrated"
+    - "{gage}"
+    - "{iterations}"
+    - "{warmup_days}"
+    - "{calibration_ratio}"
+  inputs:
+    - {name: ngen_run, type: directory, data: ngen-run, path: ngen-run,
+       description: "CFE + Noah-OWP-Modular, the only formulation ngiab-cal calibrates"}
+    - {name: gage, type: string, pattern: '(gage-)?[0-9A-Za-z]+',
+       description: "USGS gage in the subset, 01031510 or gage-01031510"}
+    - {name: iterations, type: int, default: 100, description: DDS iterations}
+    - {name: warmup_days, type: int, default: 365, description: days excluded from the objective}
+    - {name: calibration_ratio, type: float, default: 0.5,
+       description: share of the period after warm-up used for calibration; the rest validates}
+  outputs:
+    - {name: ngen_run, type: directory, data: ngen-run, path: ngen-run_calibrated}
+  cpu: 4
+  ram_mb: 4096                                          # from the CWL; checked on the first kind run
+
+- kind: pipeline
+  id: ngiab-prepare
+  version: 0.1.0
+  title: Subset the hydrofabric, then preprocess
+  inputs:
+    - {name: outlet, type: string}
+    - {name: start, type: string}
+    - {name: end, type: string}
+  steps:
+    - name: subset
+      tool: {id: hydrofabric-subset, version: 0.1.0}
+      inputs:
+        hydrofabric: {data: {id: hydrofabric-v2.2, version: 1.0.0}}
+        outlet: {input: outlet}
+    - name: preprocess
+      tool: {id: ngiab-preprocess, version: 4.9.5}
+      inputs:
+        hydrofabric: {step: subset, output: region}
+        feature: {input: outlet}
+        start_date: {input: start}
+        end_date: {input: end}
+        source: {value: nwm}
+  outputs:
+    run: {step: preprocess, output: ngen_run}
+
+- kind: pipeline
+  id: ngiab-simulation
+  version: 0.1.0
+  title: Preprocess, run NextGen, convert to cloud-native files
+  inputs:
+    - {name: feature, type: string}
+    - {name: start_date, type: string}
+    - {name: end_date, type: string}
+    - {name: hydrofabric, type: file, data: hydrofabric-gpkg}
+    - {name: hydrofabric_graph, type: file, data: hydrofabric-graph, optional: true,
+       description: "without it, the preprocessor builds the graph from the gpkg"}
+    - {name: configuration_name, type: string, default: ngiab_cfe_default}
+  steps:
+    - name: preprocess
+      tool: {id: ngiab-preprocess, version: 4.9.5}
+      inputs:
+        hydrofabric: {input: hydrofabric}
+        hydrofabric_graph: {input: hydrofabric_graph}
+        feature: {input: feature}
+        start_date: {input: start_date}
+        end_date: {input: end_date}
+    - name: run
+      tool: {id: ngiab-run, version: 2.1.0}
+      inputs:
+        ngen_run: {step: preprocess, output: ngen_run}
+    - name: to-cng
+      tool: {id: ngiab-to-cng, version: 0.1.0}
+      inputs:
+        ngen_run: {step: run, output: ngen_run}
+        configuration_name: {input: configuration_name}
+  outputs:
+    run: {step: run, output: ngen_run}
+    cng: {step: to-cng, output: cng}
+
+- kind: pipeline
+  id: ngiab-calibration
+  version: 0.1.0
+  title: Preprocess, calibrate, run NextGen with the calibrated parameters, convert to cloud-native files
+  inputs:
+    # the only pipeline-level pattern, from the wiring: gage is also the preprocessor's feature, which
+    # reads a bare 01031510 as cat-01031510, so the prefix calibrate itself doesn't need is required here
+    - {name: gage, type: string, pattern: 'gage-[0-9A-Za-z]+',
+       description: "gage-01031510: the subset outlet and the calibration gage"}
+    - {name: start_date, type: string, description: "at least 2 years: warm-up, calibration, validation"}
+    - {name: end_date, type: string}
+    - {name: hydrofabric, type: file, data: hydrofabric-gpkg}
+    - {name: hydrofabric_graph, type: file, data: hydrofabric-graph, optional: true}
+    - {name: iterations, type: int, default: 100}
+    - {name: warmup_days, type: int, default: 365}
+    - {name: calibration_ratio, type: float, default: 0.5}
+    - {name: configuration_name, type: string, default: ngiab_cfe_calibrated}
+  steps:
+    - name: preprocess
+      tool: {id: ngiab-preprocess, version: 4.9.5}
+      inputs:
+        hydrofabric: {input: hydrofabric}
+        hydrofabric_graph: {input: hydrofabric_graph}
+        feature: {input: gage}
+        start_date: {input: start_date}
+        end_date: {input: end_date}
+    - name: calibrate
+      tool: {id: ngiab-calibrate, version: 0.2.0}
+      inputs:
+        ngen_run: {step: preprocess, output: ngen_run}
+        gage: {input: gage}                             # the wrapper strips "gage-"
+        iterations: {input: iterations}
+        warmup_days: {input: warmup_days}
+        calibration_ratio: {input: calibration_ratio}
+    - name: run
+      tool: {id: ngiab-run, version: 2.1.0}
+      inputs:
+        ngen_run: {step: calibrate, output: ngen_run}
+    - name: to-cng
+      tool: {id: ngiab-to-cng, version: 0.1.0}
+      inputs:
+        ngen_run: {step: run, output: ngen_run}
+        configuration_name: {input: configuration_name}
+  outputs:
+    run: {step: run, output: ngen_run}
+    cng: {step: to-cng, output: cng}
