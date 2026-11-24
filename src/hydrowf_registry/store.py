@@ -74,8 +74,8 @@ def references(lego: Lego) -> tuple[set[tuple[str, str]], set[str]]:
     """The (id, version) keys and the data ids `lego` points at: what check() needs besides the lego."""
     keys: set[tuple[str, str]] = set()
     data_ids: set[str] = set()
-    if isinstance(lego, ToolLego):
-        data_ids = {port.data for port in lego.inputs + lego.outputs if port.data}
+    if isinstance(lego, ToolLego):              # a port's data lego, or the formats an output can write
+        data_ids = {data for port in lego.inputs + lego.outputs for data in port.choices}
     elif isinstance(lego, Pipeline):
         for step in lego.steps:
             keys.add(step.tool.key())
@@ -109,17 +109,28 @@ class Store:
             return conn.scalar(query)
 
     def _referenced(self, conn: Connection, lego: Lego, sub: str) -> list[Lego]:
-        """The legos `lego` references that it may use: public ones for a public lego, else also `sub`'s."""
+        """The legos `lego` references that it may use: public ones for a public lego, else also `sub`'s.
+        A pipeline's also include its tools' data legos: whether a link may be read in place depends on how
+        the data it carries is stored (check_pipeline's linked_read_problem)."""
         keys, data_ids = references(lego)
+        caller = None if lego.visibility == Visibility.PUBLIC else sub
+        found = self._load(conn, keys, data_ids, caller)
+        if isinstance(lego, Pipeline):
+            carried = {data for tool in found if isinstance(tool, ToolLego)
+                       for port in tool.inputs + tool.outputs for data in port.choices}
+            found += self._load(conn, set(), carried - data_ids, caller)
+        return found
+
+    def _load(self, conn: Connection, keys: set[tuple[str, str]], data_ids: set[str], caller: str | None) -> list[Lego]:
+        """The legos at `keys` and every version of the data legos `data_ids` that `caller` may see."""
         if not keys and not data_ids:
             return []
-        public_only = lego.visibility == Visibility.PUBLIC
         wanted = []
         if keys:
             wanted.append(tuple_(legos.c.id, legos.c.version).in_(list(keys)))
         if data_ids:
             wanted.append(legos.c.id.in_(list(data_ids)) & (legos.c.kind == "data"))
-        query = select(legos.c.body).where(or_(*wanted), self._visible_to(None if public_only else sub))
+        query = select(legos.c.body).where(or_(*wanted), self._visible_to(caller))
         found = []
         for body in conn.scalars(query):
             try:

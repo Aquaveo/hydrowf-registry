@@ -294,7 +294,7 @@ wheels = [
 [[package]]
 name = "hydrowf-core"
 version = "0.1.0"
-source = { git = "https://github.com/Aquaveo/hydrowf-core?rev=368115e#368115ed9d4f357c64f4c4bf13c02a16acb79864" }
+source = { git = "https://github.com/Aquaveo/hydrowf-core?rev=ee30b30#ee30b309043e236f2210a5fb78e36077889b9778" }
 dependencies = [
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -330,7 +330,7 @@ dev = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.20.1" },
     { name = "fastapi", specifier = ">=0.165.0" },
-    { name = "hydrowf-core", extras = ["auth"], git = "https://github.com/Aquaveo/hydrowf-core?rev=368115e" },
+    { name = "hydrowf-core", extras = ["auth"], git = "https://github.com/Aquaveo/hydrowf-core?rev=ee30b30" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.9" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "sqlalchemy", specifier = ">=2.1.9" },

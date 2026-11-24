@@ -110,4 +110,5 @@ uv run pytest
 - **Migrations run at every start** (Dockerfile). With several replicas on Postgres, run them once
   instead (an init Job) so two starts don't race.
 - **Listings sort in Python** after one query; fine for thousands of legos.
-- **hydrowf-ogc doesn't read from here yet**: its processes still come from its own config.
+- **Group visibility isn't read yet.** A caller sees public legos and their own; a lego shared with
+  their group isn't listed to them.
