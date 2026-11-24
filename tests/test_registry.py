@@ -26,7 +26,7 @@ from hydrowf_registry.db import lego_ids, legos, metadata
 from hydrowf_registry.seed import PLATFORM, migrate, seed
 from hydrowf_registry.store import Store
 
-LEGOS_FILE = Path(__file__).parent / "fixtures" / "legos.yaml"      # hydrowf-platform's registry/legos.yaml
+LEGOS_FILE = Path(__file__).parent / "fixtures" / "legos.yaml"      # hydrowf-ogc's registry/legos.yaml
 SHIPPED = LEGOS.validate_python(yaml.safe_load(LEGOS_FILE.read_text()))
 
 ISSUER = "https://keycloak.test/realms/hydrowf"
@@ -325,6 +325,19 @@ def test_a_pipeline_uses_only_tools_its_publisher_can_see(client):
     pipeline = with_tool(lego_like(PIPELINE, "sim-on-alice-run", visibility="owner"), "alice-run", "9.9.9")
     assert post(client, pipeline, BOB).status_code == 422          # Bob can't see Alice's private tool
     assert post(client, pipeline, ALICE).status_code == 201        # Alice can, for her own private pipeline
+
+
+def test_a_pipeline_cant_read_in_place_an_output_stored_as_one_tgz(client):
+    reader = lego_like(TOOL, "alice-reader", visibility="owner")
+    reader["inputs"] = [{**{k: v for k, v in port.items() if k != "path"}, "type": "dataset"}
+                        if port["name"] == "ngen_run" else port for port in reader["inputs"]]
+    assert post(client, reader, groups=AUTHOR).status_code == 201
+    pipeline = lego_like("ngiab-rerun", "alice-reread", visibility="owner")
+    pipeline["steps"] = [{**s, "tool": {"id": "alice-reader", "version": "9.9.9"}} if s["name"] == "run" else s
+                         for s in pipeline["steps"]]
+    response = post(client, pipeline)
+    assert response.status_code == 422, response.text           # ngen-run keeps a run as one .tgz (archive: tgz)
+    assert any(".tgz" in problem["msg"] for problem in response.json()["detail"])
 
 
 def test_a_public_lego_never_depends_on_a_private_one(client):

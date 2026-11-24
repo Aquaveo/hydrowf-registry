@@ -88,7 +88,7 @@
   version: 1.0.0
   title: NGIAB run folder
   data_kind: output
-  storage: {driver: stac, format: other}
+  storage: {driver: stac, format: other, archive: tgz}    # a working folder: one .tgz, its s3 URL in results
 
 # Images built in hydrowf-tools (nextgen/<tool>/Dockerfile) are released by a tag <tool>/v<version>,
 # which publishes ghcr.io/aquaveo/<tool>:<version>. Each is pinned here by digest (the lego model takes
@@ -172,8 +172,17 @@
   data_kind: output
   storage: {driver: stac, format: other}
 
+# 2.0.0: also carries the run inputs as they are (run/), so cng-to-ngen can rebuild a run folder that
+# reruns exactly (hydrowf-tools nextgen/cng-to-ngen; ngiab-to-cng 0.3.0 and later)
+- kind: data
+  id: ngen-cng
+  version: 2.0.0
+  title: NGIAB run as cloud-native files, rerunnable (Parquet, Zarr, COG, run/, manifest.json)
+  data_kind: output
+  storage: {driver: stac, format: other}
+
 # From hydrowf-tools nextgen/ngiab-to-cng. `command` repeats its ENTRYPOINT, so Argo's emissary
-# doesn't have to ask the registry for it (hydrowf-platform docs/argo-findings.md).
+# doesn't have to ask the registry for it (hydrowf-ogc docs/argo-findings.md).
 - kind: tool
   id: ngiab-to-cng
   version: 0.1.0
@@ -196,6 +205,47 @@
     - {name: cng, type: directory, data: ngen-cng, path: ngen-run_cng}
   cpu: 1
   ram_mb: 2048
+
+# 0.3.0: manifest 0.3 with bbox, period and `rerun`; copies the run inputs as they are into run/
+- kind: tool
+  id: ngiab-to-cng
+  version: 0.3.0
+  title: NGIAB run to cloud-native files, rerunnable
+  image: ghcr.io/aquaveo/ngiab-to-cng@sha256:9c689f6e244384f538a21a42fff65946d05e8262cf9d9525ff5e1734a71ca93c   # 0.3.0
+  command: [python, /app/ngiab_to_cng.py]
+  args:
+    - "{ngen_run}"
+    - --output
+    - "{workdir}/ngen-run_cng"
+    - --run-id
+    - "{run}"
+    - --configuration-name
+    - "{configuration_name}"
+  inputs:
+    - {name: ngen_run, type: directory, data: ngen-run, path: ngen-run}
+    - {name: configuration_name, type: string, default: ngiab, pattern: '[A-Za-z0-9][A-Za-z0-9_-]*',
+       description: TEEHR configuration name}
+  outputs:
+    - {name: cng, type: directory, data: ngen-cng, path: ngen-run_cng}
+  cpu: 1
+  ram_mb: 2048
+
+# From hydrowf-tools nextgen/cng-to-ngen: copies run/ of an ngiab-to-cng 0.3.0+ output back into a run
+# folder, checking each file's SHA-256. `command` repeats its ENTRYPOINT, as for ngiab-to-cng.
+- kind: tool
+  id: cng-to-ngen
+  version: 0.1.0
+  title: Cloud-native files back to an NGIAB run folder
+  image: ghcr.io/aquaveo/cng-to-ngen@sha256:410f23c307dab44f735d839ed2d7005973c3aa92daa8ecf8630714f663c56b08   # 0.1.0
+  command: [python, /app/cng_to_ngen.py]
+  args: ["{cng}", --output, "{workdir}/ngen-run"]
+  inputs:
+    - {name: cng, type: directory, data: ngen-cng, path: ngen-run_cng,
+       description: "from ngiab-to-cng 0.3.0 or later (its manifest lists `rerun`)"}
+  outputs:
+    - {name: ngen_run, type: directory, data: ngen-run, path: ngen-run}
+  cpu: 1
+  ram_mb: 512
 
 # From hydrowf-tools nextgen/ngiab-calibrate (ngiab-cal + ngen-cal, built on the image ngiab-run
 # uses). `command` repeats its ENTRYPOINT, as for ngiab-to-cng. The script copies the run
@@ -337,3 +387,395 @@
   outputs:
     run: {step: run, output: ngen_run}
     cng: {step: to-cng, output: cng}
+
+# 0.2.0: the same steps; to-cng is ngiab-to-cng 0.3.0, so the cng output can be rerun (ngiab-rerun)
+- kind: pipeline
+  id: ngiab-simulation
+  version: 0.2.0
+  title: Preprocess, run NextGen, convert to cloud-native files
+  inputs:
+    - {name: feature, type: string}
+    - {name: start_date, type: string}
+    - {name: end_date, type: string}
+    - {name: hydrofabric, type: file, data: hydrofabric-gpkg}
+    - {name: hydrofabric_graph, type: file, data: hydrofabric-graph, optional: true,
+       description: "without it, the preprocessor builds the graph from the gpkg"}
+    - {name: configuration_name, type: string, default: ngiab_cfe_default}
+  steps:
+    - name: preprocess
+      tool: {id: ngiab-preprocess, version: 4.9.5}
+      inputs:
+        hydrofabric: {input: hydrofabric}
+        hydrofabric_graph: {input: hydrofabric_graph}
+        feature: {input: feature}
+        start_date: {input: start_date}
+        end_date: {input: end_date}
+    - name: run
+      tool: {id: ngiab-run, version: 2.1.0}
+      inputs:
+        ngen_run: {step: preprocess, output: ngen_run}
+    - name: to-cng
+      tool: {id: ngiab-to-cng, version: 0.3.0}
+      inputs:
+        ngen_run: {step: run, output: ngen_run}
+        configuration_name: {input: configuration_name}
+  outputs:
+    run: {step: run, output: ngen_run}
+    cng: {step: to-cng, output: cng}
+
+- kind: pipeline
+  id: ngiab-calibration
+  version: 0.2.0
+  title: Preprocess, calibrate, run NextGen with the calibrated parameters, convert to cloud-native files
+  inputs:
+    # the only pipeline-level pattern, from the wiring: gage is also the preprocessor's feature, which
+    # reads a bare 01031510 as cat-01031510, so the prefix calibrate itself doesn't need is required here
+    - {name: gage, type: string, pattern: 'gage-[0-9A-Za-z]+',
+       description: "gage-01031510: the subset outlet and the calibration gage"}
+    - {name: start_date, type: string, description: "at least 2 years: warm-up, calibration, validation"}
+    - {name: end_date, type: string}
+    - {name: hydrofabric, type: file, data: hydrofabric-gpkg}
+    - {name: hydrofabric_graph, type: file, data: hydrofabric-graph, optional: true}
+    - {name: iterations, type: int, default: 100}
+    - {name: warmup_days, type: int, default: 365}
+    - {name: calibration_ratio, type: float, default: 0.5}
+    - {name: configuration_name, type: string, default: ngiab_cfe_calibrated}
+  steps:
+    - name: preprocess
+      tool: {id: ngiab-preprocess, version: 4.9.5}
+      inputs:
+        hydrofabric: {input: hydrofabric}
+        hydrofabric_graph: {input: hydrofabric_graph}
+        feature: {input: gage}
+        start_date: {input: start_date}
+        end_date: {input: end_date}
+    - name: calibrate
+      tool: {id: ngiab-calibrate, version: 0.2.0}
+      inputs:
+        ngen_run: {step: preprocess, output: ngen_run}
+        gage: {input: gage}                             # the wrapper strips "gage-"
+        iterations: {input: iterations}
+        warmup_days: {input: warmup_days}
+        calibration_ratio: {input: calibration_ratio}
+    - name: run
+      tool: {id: ngiab-run, version: 2.1.0}
+      inputs:
+        ngen_run: {step: calibrate, output: ngen_run}
+    - name: to-cng
+      tool: {id: ngiab-to-cng, version: 0.3.0}
+      inputs:
+        ngen_run: {step: run, output: ngen_run}
+        configuration_name: {input: configuration_name}
+  outputs:
+    run: {step: run, output: ngen_run}
+    cng: {step: to-cng, output: cng}
+
+# Rerun a run from its cloud-native output: rebuild the run folder (cng-to-ngen), run NextGen again and
+# convert. The cng input must come from ngiab-to-cng 0.3.0 or later; an older one is refused by cng-to-ngen.
+- kind: pipeline
+  id: ngiab-rerun
+  version: 0.1.0
+  title: Rerun NextGen from a cloud-native output, convert to cloud-native files
+  inputs:
+    - {name: cng, type: directory, data: ngen-cng,
+       description: "the cng output of an earlier ngiab-simulation, ngiab-calibration or ngiab-rerun job (0.2.0+)"}
+    - {name: configuration_name, type: string, default: ngiab_rerun}
+  steps:
+    - name: rebuild
+      tool: {id: cng-to-ngen, version: 0.1.0}
+      inputs:
+        cng: {input: cng}
+    - name: run
+      tool: {id: ngiab-run, version: 2.1.0}
+      inputs:
+        ngen_run: {step: rebuild, output: ngen_run}
+    - name: to-cng
+      tool: {id: ngiab-to-cng, version: 0.3.0}
+      inputs:
+        ngen_run: {step: run, output: ngen_run}
+        configuration_name: {input: configuration_name}
+  outputs:
+    run: {step: run, output: ngen_run}
+    cng: {step: to-cng, output: cng}
+
+# ---- TEEHR evaluation (hydrowf-tools docs/design/teehr-evaluation.md)
+
+# What an evaluation reads; any model's tool can write it (ngiab-to-cng --format teehr-timeseries for NextGen):
+# manifest.json, timeseries/secondary.parquet (TEEHR's schema and names), crosswalk.parquet (to usgs-<site>)
+- kind: data
+  id: teehr-timeseries
+  version: 1.0.0
+  title: Simulated time series for evaluation, with a crosswalk to USGS gages (TEEHR schema)
+  data_kind: output
+  storage: {driver: stac, format: other}
+
+# teehr-evaluate's output: metrics.parquet, locations.parquet (the gages, GeoParquet) and manifest.json
+- kind: data
+  id: teehr-metrics
+  version: 1.0.0
+  title: TEEHR metrics per gage and configuration, and the gages evaluated
+  data_kind: output
+  storage: {driver: stac, format: other}
+
+# 0.4.0: --format writes ngen-cng (as 0.3.0) or teehr-timeseries (hydrowf-tools nextgen/ngiab-to-cng)
+- kind: tool
+  id: ngiab-to-cng
+  version: 0.4.0
+  title: NGIAB run to cloud-native files, or to TEEHR time series for evaluation
+  image: ghcr.io/aquaveo/ngiab-to-cng@sha256:953ea53082e82c73431b1e33e52497fde8a2bbb6d16edaa7ab67932c10122b8f   # 0.4.0
+  command: [python, /app/ngiab_to_cng.py]
+  args:
+    - "{ngen_run}"
+    - --output
+    - "{workdir}/ngen-run_cng"
+    - --run-id
+    - "{run}"
+    - --configuration-name
+    - "{configuration_name}"
+    - --format
+    - "{cng_format}"
+  inputs:
+    - {name: ngen_run, type: directory, data: ngen-run, path: ngen-run}
+    - {name: configuration_name, type: string, default: ngiab, pattern: '[A-Za-z0-9][A-Za-z0-9_-]*',
+       description: TEEHR configuration name}
+  outputs:
+    - {name: cng, type: directory, formats: [ngen-cng, teehr-timeseries], path: ngen-run_cng}
+  cpu: 1
+  ram_mb: 2048
+
+# From hydrowf-tools evaluation/teehr-evaluate. `command` is the image's whole ENTRYPOINT: entrypoint.sh gives
+# a uid the image doesn't name a user name, which Spark's Hadoop needs. Needs the internet (USGS, NOAA).
+- kind: tool
+  id: teehr-evaluate
+  version: 0.1.0
+  title: Evaluate simulated time series against USGS observations (TEEHR)
+  image: ghcr.io/aquaveo/teehr-evaluate@sha256:f220a40eda744089893a4eb35f7b6e5cea8747d8f175f3dd52d7c2fb9dad5915   # 0.1.0
+  command: [/app/entrypoint.sh, python, /app/teehr_evaluate.py]
+  args:
+    - "{timeseries}"
+    - --output
+    - "{workdir}/evaluation"
+    - --run-id
+    - "{run}"
+    - --metrics
+    - "{metrics}"
+    - --baseline
+    - "{baseline}"
+  inputs:
+    - {name: timeseries, type: dataset, data: teehr-timeseries}          # read in place with the step's keys
+    - {name: metrics, type: string, default: "kge,nse,relative_bias,rmsdr",
+       pattern: '(kge|kge_mod1|kge_mod2|nse|nnse|relative_bias|rmsdr|rmse|mae|pearson|r2|annual_peak_relative_bias)(,(kge|kge_mod1|kge_mod2|nse|nnse|relative_bias|rmsdr|rmse|mae|pearson|r2|annual_peak_relative_bias))*',
+       description: "distinct names, comma-separated, from kge, kge_mod1, kge_mod2, nse, nnse, relative_bias, rmsdr, rmse, mae, pearson, r2, annual_peak_relative_bias"}
+    - {name: baseline, type: enum, symbols: [none, nwm30_retrospective], default: none,
+       description: "nwm30_retrospective also evaluates the NWM 3.0 retrospective at the same gages (1979-02 to 2023-01)"}
+  outputs:
+    - {name: evaluation, type: directory, data: teehr-metrics, path: evaluation}
+  env:                                    # on the workdir, render's emptyDir: not the container's own layer
+    HOME: "{workdir}"                     # entrypoint.sh's passwd file, Spark's and Java's home
+    TMPDIR: "{workdir}"                   # the TEEHR evaluation's temporary folder
+  network: true
+  cpu: 2
+  # measured on kind with a one-gage input: 3.1 GiB peak, 3.6 GiB with the NWM baseline (Spark's JVM and
+  # Python's libraries, not the data); 4096 was OOMKilled (the pod's limit counts page cache too)
+  ram_mb: 6144
+
+- kind: pipeline
+  id: ngiab-evaluation
+  version: 0.1.0
+  title: Preprocess, run NextGen, evaluate it against USGS observations (TEEHR)
+  inputs:
+    - {name: feature, type: string}
+    - {name: start_date, type: string}
+    - {name: end_date, type: string}
+    - {name: hydrofabric, type: file, data: hydrofabric-gpkg}
+    - {name: hydrofabric_graph, type: file, data: hydrofabric-graph, optional: true,
+       description: "without it, the preprocessor builds the graph from the gpkg"}
+    - {name: configuration_name, type: string, default: ngiab_cfe_default,
+       description: "the simulation's name in the metrics; not usgs_observations or nwm30_retrospective (TEEHR's own)"}
+    - {name: metrics, type: string, default: "kge,nse,relative_bias,rmsdr",
+       description: "distinct names, comma-separated, from kge, kge_mod1, kge_mod2, nse, nnse, relative_bias, rmsdr, rmse, mae, pearson, r2, annual_peak_relative_bias"}
+    - {name: baseline, type: enum, symbols: [none, nwm30_retrospective], default: none,
+       description: "nwm30_retrospective also evaluates the NWM 3.0 retrospective at the same gages (1979-02 to 2023-01)"}
+  steps:
+    - name: preprocess
+      tool: {id: ngiab-preprocess, version: 4.9.5}
+      inputs:
+        hydrofabric: {input: hydrofabric}
+        hydrofabric_graph: {input: hydrofabric_graph}
+        feature: {input: feature}
+        start_date: {input: start_date}
+        end_date: {input: end_date}
+    - name: run
+      tool: {id: ngiab-run, version: 2.1.0}
+      inputs:
+        ngen_run: {step: preprocess, output: ngen_run}
+    - name: to-teehr
+      tool: {id: ngiab-to-cng, version: 0.4.0}
+      formats: {cng: teehr-timeseries}
+      inputs:
+        ngen_run: {step: run, output: ngen_run}
+        configuration_name: {input: configuration_name}
+    - name: evaluate                      # reads to-teehr's output in place (hydrowf-core design D.7)
+      tool: {id: teehr-evaluate, version: 0.1.0}
+      inputs:
+        timeseries: {step: to-teehr, output: cng}
+        metrics: {input: metrics}
+        baseline: {input: baseline}
+  outputs:
+    run: {step: run, output: ngen_run}
+    timeseries: {step: to-teehr, output: cng}
+    evaluation: {step: evaluate, output: evaluation}
+
+- kind: pipeline
+  id: teehr-evaluation
+  version: 0.1.0
+  title: Evaluate an earlier job's simulated time series against USGS observations (TEEHR)
+  inputs:
+    - {name: timeseries, type: dataset, data: teehr-timeseries,
+       description: "the timeseries output of an earlier ngiab-evaluation job of yours (or any teehr-timeseries)"}
+    - {name: metrics, type: string, default: "kge,nse,relative_bias,rmsdr",
+       description: "distinct names, comma-separated, from kge, kge_mod1, kge_mod2, nse, nnse, relative_bias, rmsdr, rmse, mae, pearson, r2, annual_peak_relative_bias"}
+    - {name: baseline, type: enum, symbols: [none, nwm30_retrospective], default: none,
+       description: "nwm30_retrospective also evaluates the NWM 3.0 retrospective at the same gages (1979-02 to 2023-01)"}
+  steps:
+    - name: evaluate
+      tool: {id: teehr-evaluate, version: 0.1.0}
+      inputs:
+        timeseries: {input: timeseries}
+        metrics: {input: metrics}
+        baseline: {input: baseline}
+  outputs:
+    evaluation: {step: evaluate, output: evaluation}
+
+# ---- TEEHR follow-ups: the 0.1.0 pipelines above stay as published (their tools refuse a repeated metric)
+
+# 0.4.1: refuses a --configuration-name TEEHR uses for its own data, in either format, before converting
+- kind: tool
+  id: ngiab-to-cng
+  version: 0.4.1
+  title: NGIAB run to cloud-native files, or to TEEHR time series for evaluation
+  image: ghcr.io/aquaveo/ngiab-to-cng@sha256:71fb90d98d8b86181804288701396afee6726b6241ff637559e662d8d5c3d4ae   # 0.4.1
+  command: [python, /app/ngiab_to_cng.py]
+  args:
+    - "{ngen_run}"
+    - --output
+    - "{workdir}/ngen-run_cng"
+    - --run-id
+    - "{run}"
+    - --configuration-name
+    - "{configuration_name}"
+    - --format
+    - "{cng_format}"
+  inputs:
+    - {name: ngen_run, type: directory, data: ngen-run, path: ngen-run}
+    - {name: configuration_name, type: string, default: ngiab, pattern: '[A-Za-z0-9][A-Za-z0-9_-]*',
+       description: "TEEHR configuration name; usgs_observations and nwm30_retrospective (TEEHR's own) are refused"}
+  outputs:
+    - {name: cng, type: directory, formats: [ngen-cng, teehr-timeseries], path: ngen-run_cng}
+  cpu: 1
+  ram_mb: 2048
+
+# 0.1.1: a repeated metric is dropped (the first kept), not refused: the pattern can't exclude repeats
+- kind: tool
+  id: teehr-evaluate
+  version: 0.1.1
+  title: Evaluate simulated time series against USGS observations (TEEHR)
+  image: ghcr.io/aquaveo/teehr-evaluate@sha256:3e0a61cfcdf8a9d7338759e2044202b2652465c077ac9da735d4376e1796e443   # 0.1.1
+  command: [/app/entrypoint.sh, python, /app/teehr_evaluate.py]
+  args:
+    - "{timeseries}"
+    - --output
+    - "{workdir}/evaluation"
+    - --run-id
+    - "{run}"
+    - --metrics
+    - "{metrics}"
+    - --baseline
+    - "{baseline}"
+  inputs:
+    - {name: timeseries, type: dataset, data: teehr-timeseries}          # read in place with the step's keys
+    - {name: metrics, type: string, default: "kge,nse,relative_bias,rmsdr",
+       pattern: '(kge|kge_mod1|kge_mod2|nse|nnse|relative_bias|rmsdr|rmse|mae|pearson|r2|annual_peak_relative_bias)(,(kge|kge_mod1|kge_mod2|nse|nnse|relative_bias|rmsdr|rmse|mae|pearson|r2|annual_peak_relative_bias))*',
+       description: "comma-separated, from kge, kge_mod1, kge_mod2, nse, nnse, relative_bias, rmsdr, rmse, mae, pearson, r2, annual_peak_relative_bias; a repeated name is dropped"}
+    - {name: baseline, type: enum, symbols: [none, nwm30_retrospective], default: none,
+       description: "nwm30_retrospective also evaluates the NWM 3.0 retrospective at the same gages (1979-02 to 2023-01)"}
+  outputs:
+    - {name: evaluation, type: directory, data: teehr-metrics, path: evaluation}
+  env:                                    # as 0.1.0: on the workdir, render's emptyDir
+    HOME: "{workdir}"
+    TMPDIR: "{workdir}"
+  network: true
+  cpu: 2
+  ram_mb: 6144                            # as 0.1.0: 3.6 GiB measured at peak with the NWM baseline
+
+# 0.2.0: ngiab-to-cng 0.4.1 and teehr-evaluate 0.1.1. configuration_name starts with ngiab, so a job
+# naming the simulation as TEEHR's own data (usgs_observations, nwm30_retrospective) is refused when it
+# is submitted, not after NextGen has run (patterns run on Rust's regex: no lookarounds to exclude names)
+- kind: pipeline
+  id: ngiab-evaluation
+  version: 0.2.0
+  title: Preprocess, run NextGen, evaluate it against USGS observations (TEEHR)
+  inputs:
+    - {name: feature, type: string}
+    - {name: start_date, type: string}
+    - {name: end_date, type: string}
+    - {name: hydrofabric, type: file, data: hydrofabric-gpkg}
+    - {name: hydrofabric_graph, type: file, data: hydrofabric-graph, optional: true,
+       description: "without it, the preprocessor builds the graph from the gpkg"}
+    - {name: configuration_name, type: string, default: ngiab_cfe_default, pattern: 'ngiab[A-Za-z0-9_-]*',
+       description: "the simulation's name in the metrics, starting with ngiab (so it can't be usgs_observations or nwm30_retrospective, TEEHR's own)"}
+    - {name: metrics, type: string, default: "kge,nse,relative_bias,rmsdr",
+       description: "comma-separated, from kge, kge_mod1, kge_mod2, nse, nnse, relative_bias, rmsdr, rmse, mae, pearson, r2, annual_peak_relative_bias; a repeated name is dropped"}
+    - {name: baseline, type: enum, symbols: [none, nwm30_retrospective], default: none,
+       description: "nwm30_retrospective also evaluates the NWM 3.0 retrospective at the same gages (1979-02 to 2023-01)"}
+  steps:
+    - name: preprocess
+      tool: {id: ngiab-preprocess, version: 4.9.5}
+      inputs:
+        hydrofabric: {input: hydrofabric}
+        hydrofabric_graph: {input: hydrofabric_graph}
+        feature: {input: feature}
+        start_date: {input: start_date}
+        end_date: {input: end_date}
+    - name: run
+      tool: {id: ngiab-run, version: 2.1.0}
+      inputs:
+        ngen_run: {step: preprocess, output: ngen_run}
+    - name: to-teehr
+      tool: {id: ngiab-to-cng, version: 0.4.1}
+      formats: {cng: teehr-timeseries}
+      inputs:
+        ngen_run: {step: run, output: ngen_run}
+        configuration_name: {input: configuration_name}
+    - name: evaluate                      # reads to-teehr's output in place (hydrowf-core design D.7)
+      tool: {id: teehr-evaluate, version: 0.1.1}
+      inputs:
+        timeseries: {step: to-teehr, output: cng}
+        metrics: {input: metrics}
+        baseline: {input: baseline}
+  outputs:
+    run: {step: run, output: ngen_run}
+    timeseries: {step: to-teehr, output: cng}
+    evaluation: {step: evaluate, output: evaluation}
+
+# 0.2.0: teehr-evaluate 0.1.1
+- kind: pipeline
+  id: teehr-evaluation
+  version: 0.2.0
+  title: Evaluate an earlier job's simulated time series against USGS observations (TEEHR)
+  inputs:
+    - {name: timeseries, type: dataset, data: teehr-timeseries,
+       description: "the timeseries output of an earlier ngiab-evaluation job of yours (or any teehr-timeseries)"}
+    - {name: metrics, type: string, default: "kge,nse,relative_bias,rmsdr",
+       description: "comma-separated, from kge, kge_mod1, kge_mod2, nse, nnse, relative_bias, rmsdr, rmse, mae, pearson, r2, annual_peak_relative_bias; a repeated name is dropped"}
+    - {name: baseline, type: enum, symbols: [none, nwm30_retrospective], default: none,
+       description: "nwm30_retrospective also evaluates the NWM 3.0 retrospective at the same gages (1979-02 to 2023-01)"}
+  steps:
+    - name: evaluate
+      tool: {id: teehr-evaluate, version: 0.1.1}
+      inputs:
+        timeseries: {input: timeseries}
+        metrics: {input: metrics}
+        baseline: {input: baseline}
+  outputs:
+    evaluation: {step: evaluate, output: evaluation}
